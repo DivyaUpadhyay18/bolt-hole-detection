@@ -18,7 +18,7 @@ import streamlit as st
 
 from cuda_backend import get_backend_info, probe_cuda
 from detector import BoltHoleDetector
-from panel_finder import find_bscan_roi
+from panel_finder import find_bscan_roi, read_dst_value
 from tracker import BoltHoleTracker
 from utils import process_frame
 
@@ -95,6 +95,7 @@ def _init_session_state():
         "max_pair_dist": 55,
         "show_roi": True,
         "show_blobs": True,
+        "dst_debug_shown": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -107,6 +108,8 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
     total = st.session_state.total_frames
     processed_count = 0
     last_result = None
+    cached_distance = None
+    last_dst_read_frame = -10
 
     try:
         while cap.isOpened():
@@ -125,6 +128,23 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
                     progress_ph.progress(min(frame_num / total, 1.0))
                 continue
 
+            if (
+                not st.session_state.dst_debug_shown
+                and frame_num == st.session_state.frame_skip
+            ):
+                H_f, W_f = frame.shape[:2]
+                dst_region = frame[0 : int(H_f * 0.20), int(W_f * 0.60) : W_f]
+                dst_region_rgb = cv2.cvtColor(dst_region, cv2.COLOR_BGR2RGB)
+                st.sidebar.image(
+                    dst_region_rgb,
+                    caption="DST region being read by OCR",
+                    use_container_width=True,
+                )
+                st.sidebar.write(
+                    "If distance shows N/A, check that the DST value is visible in this image."
+                )
+                st.session_state.dst_debug_shown = True
+
             st.session_state.cached_roi = _update_cached_roi(
                 st.session_state.cached_roi, frame, frame_num
             )
@@ -139,6 +159,15 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
                 cached_roi["x_left"] : cached_roi["x_right"],
             ]
 
+            # Only re-read DST every 10 processed frames (or if missing)
+            if (len(st.session_state.frame_results) % 10 == 0) or (
+                cached_distance is None
+            ):
+                new_dst = read_dst_value(frame)
+                last_dst_read_frame = frame_num
+                if new_dst is not None:
+                    cached_distance = new_dst
+
             result = process_frame(
                 frame,
                 st.session_state.detector,
@@ -149,6 +178,7 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
                 frame_num=frame_num,
                 roi_dict=roi_dict,
                 show_blobs=st.session_state.show_blobs,
+                current_distance=cached_distance,
             )
 
             ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
@@ -158,6 +188,7 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
                     "time_sec": round(ts, 2),
                     "active_holes": len(result["tracked_holes"]),
                     "total_unique": result["total_unique"],
+                    "distance": result.get("current_distance"),
                 }
             )
             processed_count += 1
@@ -180,9 +211,12 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
                     use_container_width=True,
                     caption=f"Frame {frame_num}",
                 )
+                dist_text = result.get("current_distance", None) or "Reading..."
                 count_ph.markdown(
-                    f"## Active: {len(result['tracked_holes'])}\n\n"
-                    f"**Total unique:** {result['total_unique']}"
+                    f"## 🟢 {len(result['tracked_holes'])}\n"
+                    f"### Active holes\n\n"
+                    f"**Total unique:** {result['total_unique']}\n\n"
+                    f"**Distance:** `{dist_text}`"
                 )
                 progress_ph.progress(min(frame_num / total, 1.0))
                 status_ph.caption(
@@ -200,9 +234,12 @@ def _run_video_processing(frame_ph, count_ph, progress_ph, status_ph):
             use_container_width=True,
             caption=f"Frame {st.session_state.frame_results[-1]['frame']}",
         )
+        dist_text = last_result.get("current_distance", None) or "Reading..."
         count_ph.markdown(
-            f"## Active: {len(last_result['tracked_holes'])}\n\n"
-            f"**Total unique:** {last_result['total_unique']}"
+            f"## 🟢 {len(last_result['tracked_holes'])}\n"
+            f"### Active holes\n\n"
+            f"**Total unique:** {last_result['total_unique']}\n\n"
+            f"**Distance:** `{dist_text}`"
         )
 
     progress_ph.progress(1.0)
@@ -240,64 +277,37 @@ def _show_results():
         )
 
         st.markdown("---")
-        st.header("Individual Hole Navigator")
+        st.header("Bolt Hole Distance Table")
 
         if tracker and tracker.hole_history:
-            history_df = pd.DataFrame(
+            simple_table = pd.DataFrame(
                 [
                     {
                         "Hole": h["label"],
-                        "First Frame": h["first_frame"],
-                        "Last Frame": h["last_frame"],
-                        "Duration": h["last_frame"] - h["first_frame"],
-                        "Position X": h["cx"],
-                        "Position Y": h["cy"],
+                        "Distance": h.get("first_distance") or "N/A",
                     }
                     for h in tracker.hole_history
                 ]
             )
 
-            st.subheader(
-                f"Total unique holes: {len(tracker.hole_history)}"
-            )
-            st.dataframe(history_df, use_container_width=True)
+            st.subheader(f"Total unique holes: {len(tracker.hole_history)}")
 
-            selected = st.selectbox(
-                "Jump to hole:",
-                [h["label"] for h in tracker.hole_history],
+            st.dataframe(
+                simple_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Hole": st.column_config.TextColumn("Hole", width="small"),
+                    "Distance": st.column_config.TextColumn(
+                        "Distance (Km:Mt:MM)", width="medium"
+                    ),
+                },
             )
-            hole = next(
-                h for h in tracker.hole_history if h["label"] == selected
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Hole ID", hole["label"])
-            c2.metric("First frame", hole["first_frame"])
-            c3.metric("Last frame", hole["last_frame"])
-            c4.metric(
-                "Active frames",
-                hole["last_frame"] - hole["first_frame"],
-            )
-
-            if stored_frames:
-                nearest = min(
-                    stored_frames.keys(),
-                    key=lambda k: abs(k - hole["first_frame"]),
-                )
-                rgb = cv2.cvtColor(
-                    stored_frames[nearest], cv2.COLOR_BGR2RGB
-                )
-                st.image(
-                    rgb,
-                    caption=f"{selected} - frame {nearest}",
-                    use_container_width=True,
-                )
 
             st.download_button(
-                "Download Hole History CSV",
-                history_df.to_csv(index=False),
-                "hole_history.csv",
-                mime="text/csv",
+                "Download Distance Table CSV",
+                simple_table.to_csv(index=False),
+                "bolt_hole_distances.csv",
             )
 
 

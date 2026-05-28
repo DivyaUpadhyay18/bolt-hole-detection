@@ -27,6 +27,100 @@ def group_rows(rows, gap=10):
     return [int(np.median(g)) for g in groups]
 
 
+def read_dst_value(frame):
+    """
+    Read the DST distance value from top-right of frame.
+    The value looks like: 0074:0009:0590
+    It sits directly below the label "DST:Km:Mt:MM INC"
+    in the top-right corner of the SRT BScan software window.
+    """
+    import re
+
+    H, W = frame.shape[:2]
+
+    search_regions = [
+        (0.00, 0.15, 0.60, 1.00),
+        (0.00, 0.20, 0.55, 1.00),
+        (0.00, 0.25, 0.50, 1.00),
+        (0.00, 0.30, 0.40, 1.00),
+    ]
+
+    pattern = re.compile(r"\b(\d{3,4}[:\-]\d{3,4}[:\-]\d{3,4})\b")
+
+    for (ys, ye, xs, xe) in search_regions:
+        y0 = int(H * ys)
+        y1 = int(H * ye)
+        x0 = int(W * xs)
+        x1 = int(W * xe)
+        roi = frame[y0:y1, x0:x1]
+
+        if roi.size == 0:
+            continue
+
+        preprocessed = []
+
+        scale = 3
+        h_r, w_r = roi.shape[:2]
+        big = cv2.resize(
+            roi, (w_r * scale, h_r * scale), interpolation=cv2.INTER_CUBIC
+        )
+        grey_a = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        preprocessed.append(grey_a)
+
+        _, thresh_b = cv2.threshold(grey_a, 127, 255, cv2.THRESH_BINARY)
+        preprocessed.append(thresh_b)
+
+        _, thresh_c = cv2.threshold(grey_a, 127, 255, cv2.THRESH_BINARY_INV)
+        preprocessed.append(thresh_c)
+
+        _, thresh_d = cv2.threshold(
+            grey_a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        preprocessed.append(thresh_d)
+
+        for img in preprocessed:
+            try:
+                import pytesseract
+
+                for psm in [6, 7, 8, 11, 13]:
+                    config = (
+                        f"--psm {psm} --oem 3 "
+                        "-c tessedit_char_whitelist="
+                        "0123456789:.-"
+                    )
+                    text = pytesseract.image_to_string(img, config=config)
+                    matches = pattern.findall(text)
+                    if matches:
+                        dst = matches[0]
+                        print(
+                            f"[DST] FOUND: {dst} "
+                            f"region=({ys:.0%},{xs:.0%}) "
+                            f"psm={psm}"
+                        )
+                        return dst
+            except Exception as e:
+                print(f"[DST] OCR error: {e}")
+                continue
+
+    try:
+        import pytesseract
+
+        grey_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        text = pytesseract.image_to_string(grey_full, config="--psm 11 --oem 3")
+        matches = pattern.findall(text)
+        if matches:
+            for m in matches:
+                parts = re.split(r"[:\-]", m)
+                if len(parts) == 3 and int(parts[0]) > 10:
+                    print(f"[DST] full frame fallback: {m}")
+                    return m
+    except Exception as e:
+        print(f"[DST] full frame fallback error: {e}")
+
+    print("[DST] could not read distance from this frame")
+    return None
+
+
 def _search_region(frame):
     """Bottom 70%, left 60% of frame."""
     h, w = frame.shape[:2]
