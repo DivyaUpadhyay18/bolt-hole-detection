@@ -1,0 +1,10 @@
+# CPU-only wheel (default). For RTX GPU see INSTALL_CUDA_OPENCV.md
+# and replace with a CUDA-enabled opencv-contrib wheel.
+opencv-python
+numpy
+streamlit
+scipy
+matplotlib
+Pillow
+pandas
+pytesseract

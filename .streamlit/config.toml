@@ -1,0 +1,3 @@
+[server]
+# Maximum upload size in megabytes (5120 MB = 5 GB)
+maxUploadSize = 5120
